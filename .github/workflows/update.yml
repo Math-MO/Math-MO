@@ -1,0 +1,50 @@
+name: Update profile card
+
+on:
+  schedule:
+    - cron: "17 5 * * *"      # daily, 05:17 UTC
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [generate.py, assets/**, .github/workflows/update.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-profile
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet pillow
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
+
+      - name: Generate SVGs
+        env:
+          PROFILE_LOGIN: Math-MO
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python generate.py
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add profile.svg profile-light.svg cache/
+          if git diff --cached --quiet; then
+            echo "Nothing changed"
+          else
+            git commit -m "chore: refresh profile card"
+            git push
+          fi
