@@ -32,9 +32,16 @@ TOKEN = os.environ.get("ACCESS_TOKEN") or os.environ.get("GITHUB_TOKEN")
 BIRTHDAY = date(2002, 1, 19)
 JOINED_MYO = date(2026, 6, 8)
 
-LOGO_COLS = 90
 INFO_WIDTH = 92
-RAMP = " .:-=+*#%@"
+FONT_SIZE = 12
+LINE_H = 15
+CHAR_W = 7.3
+PAD = 20
+# The logo uses a smaller font => more cells across the same card width.
+LOGO_FONT_SIZE = 10
+LOGO_LINE_H = 11
+LOGO_CHAR_W = 6.1
+LOGO_COLS = int(INFO_WIDTH * CHAR_W / LOGO_CHAR_W)
 
 # --------------------------------------------------------------------------- #
 # Pure helpers (unit-tested in tests/test_generate.py)
@@ -108,11 +115,20 @@ def is_me(login: str | None, email: str | None) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Logo -> ASCII (each cell tagged 'ring' for the beige O, 'mark' for the text)
+# Logo -> half-block pixel art. Each character cell holds two vertical pixels
+# (▀ top, ▄ bottom, █ both); a cell whose halves differ in colour is drawn as
+# two overlapping <text> layers at the same baseline.
+# Classes: 'ring' = the beige O, 'mark' = the black lettering.
 # --------------------------------------------------------------------------- #
 
-def render_logo(path: Path, cols: int = LOGO_COLS, char_aspect: float = 0.5,
-                gamma: float = 0.8, ring_boost: float = 1.7) -> list[list[tuple[str, str]]]:
+Segment = tuple[str, str]          # (text, css class)
+Line = list[Segment]
+
+THRESHOLD = {"mark": 0.40, "ring": 0.35}   # coverage needed to light a pixel, per colour
+
+
+def render_logo(path: Path, cols: int = LOGO_COLS, char_aspect: float = 0.5) -> list[list[Line]]:
+    """Return rows; each row is 1 or 2 layers (Lines) to draw at the same y."""
     from PIL import Image, ImageOps
 
     im = Image.open(path).convert("RGBA")
@@ -120,27 +136,66 @@ def render_logo(path: Path, cols: int = LOGO_COLS, char_aspect: float = 0.5,
     rgb = Image.alpha_composite(bg, im).convert("RGB")
     gray = rgb.convert("L")
     bbox = ImageOps.invert(gray).point(lambda p: 255 if p > 20 else 0).getbbox()
-    rgb, gray = rgb.crop(bbox), gray.crop(bbox)
-    w, h = gray.size
-    rows = max(1, int(h / w * cols * char_aspect))
-    rgb = rgb.resize((cols, rows), Image.LANCZOS)
-    gray = gray.resize((cols, rows), Image.LANCZOS)
+    rgb = rgb.crop(bbox)
+    w, h = rgb.size
+    rows = max(1, int(h / w * cols * char_aspect)) * 2          # 2 pixels per cell
 
-    out: list[list[tuple[str, str]]] = []
-    for y in range(rows):
-        line: list[tuple[str, str]] = []
+    # Split the source into two coverage masks *before* downsampling, so a cell
+    # where the beige ring runs behind a black letter keeps the letter.
+    mark_mask = Image.new("L", rgb.size)
+    ring_mask = Image.new("L", rgb.size)
+    mark_px, ring_px = mark_mask.load(), ring_mask.load()
+    src = rgb.load()
+    for yy in range(h):
+        for xx in range(w):
+            r, g, b = src[xx, yy]
+            lum = (r * 299 + g * 587 + b * 114) // 1000
+            if lum < 110:
+                mark_px[xx, yy] = 255
+            elif r - b > 25:
+                ring_px[xx, yy] = 255
+    mark_cov = mark_mask.resize((cols, rows), Image.BOX).load()
+    ring_cov = ring_mask.resize((cols, rows), Image.BOX).load()
+
+    def pixel(x: int, y: int) -> str | None:
+        if mark_cov[x, y] / 255.0 > THRESHOLD["mark"]:
+            return "mark"
+        if ring_cov[x, y] / 255.0 > THRESHOLD["ring"]:
+            return "ring"
+        return None
+
+    out: list[list[Line]] = []
+    for y in range(0, rows, 2):
+        layer1: list[tuple[str, str | None]] = []
+        layer2: list[tuple[str, str | None]] = []
         for x in range(cols):
-            r, g, b = rgb.getpixel((x, y))
-            ink = ((255 - gray.getpixel((x, y))) / 255.0) ** gamma
-            cls = "ring" if (r - b) > 25 else "mark"
-            if cls == "ring":
-                ink = min(1.0, ink * ring_boost)
-            ch = RAMP[min(len(RAMP) - 1, int(ink * (len(RAMP) - 1) + 0.5))]
-            line.append((ch, cls))
-        while line and line[-1][0] == " ":
-            line.pop()
-        out.append(line)
+            t, b = pixel(x, y), pixel(x, y + 1)
+            if t and b and t == b:
+                layer1.append(("█", t)); layer2.append((" ", None))
+            elif t and b:
+                layer1.append(("▀", t)); layer2.append(("▄", b))
+            elif t:
+                layer1.append(("▀", t)); layer2.append((" ", None))
+            elif b:
+                layer1.append(("▄", b)); layer2.append((" ", None))
+            else:
+                layer1.append((" ", None)); layer2.append((" ", None))
+        out.append([_merge_runs(layer) for layer in (layer1, layer2) if any(c != " " for c, _ in layer)])
     return out
+
+
+def _merge_runs(cells: list[tuple[str, str | None]]) -> Line:
+    """Collapse consecutive cells of the same class into one segment (blank cells -> 'dots')."""
+    line: Line = []
+    for ch, cls in cells:
+        cls = cls or "dots"
+        if line and line[-1][1] == cls:
+            line[-1] = (line[-1][0] + ch, cls)
+        else:
+            line.append((ch, cls))
+    while line and line[-1][0].strip() == "":
+        line.pop()
+    return line
 
 
 # --------------------------------------------------------------------------- #
@@ -304,10 +359,6 @@ def collect_stats() -> dict:
 # Info block
 # --------------------------------------------------------------------------- #
 
-Segment = tuple[str, str]          # (text, css class)
-Line = list[Segment]
-
-
 def info_lines(stats: dict, today: date) -> list[Line]:
     def row(label: str, value: str, width: int = INFO_WIDTH) -> Line:
         lab, dots, val = leader(label, value, width)
@@ -371,17 +422,12 @@ THEMES = {
     "light": dict(bg="#ffffff", text="#24292f", label="#9a6700", dots="#afb8c1",
                   ring="#c9a58c", mark="#1f2328", green="#1a7f37", red="#cf222e"),
 }
-FONT_SIZE = 12
-LINE_H = 15
-CHAR_W = 7.3
-PAD = 20
 
 
-def build_svg(logo: list[Line], info: list[Line], theme: dict) -> str:
-    lines = logo + [[]] + info
-    n_cols = max([sum(len(t) for t, _ in ln) for ln in lines] + [INFO_WIDTH])
+def build_svg(logo: list[list[Line]], info: list[Line], theme: dict) -> str:
+    n_cols = max([sum(len(t) for t, _ in ln) for ln in info] + [INFO_WIDTH])
     width = int(n_cols * CHAR_W) + 2 * PAD
-    height = len(lines) * LINE_H + 2 * PAD
+    height = len(logo) * LOGO_LINE_H + LINE_H + len(info) * LINE_H + 2 * PAD
 
     css = "\n".join(f".{k} {{ fill: {v}; }}" for k, v in theme.items() if k != "bg")
     out = [
@@ -391,12 +437,21 @@ def build_svg(logo: list[Line], info: list[Line], theme: dict) -> str:
         f"<style>{css}\n.label {{ font-weight: 600; }}</style>",
         f'<rect width="100%" height="100%" rx="8" fill="{theme["bg"]}"/>',
     ]
-    y = PAD + FONT_SIZE
-    for ln in lines:
+
+    def text(ln: Line, y: int, size: int = FONT_SIZE) -> str:
+        # NBSP: leading/multiple spaces survive every renderer (xml:space is not universally honoured)
+        spans = "".join(f'<tspan class="{cls}">{esc(t).replace(" ", "&#160;")}</tspan>' for t, cls in ln if t)
+        attr = f' font-size="{size}"' if size != FONT_SIZE else ""
+        return f'<text x="{PAD}" y="{y}"{attr}>{spans}</text>'
+
+    y = PAD + LOGO_FONT_SIZE
+    for layers in logo:
+        out.extend(text(layer, y, LOGO_FONT_SIZE) for layer in layers)
+        y += LOGO_LINE_H
+    y += LINE_H
+    for ln in info:
         if ln:
-            # NBSP: leading/multiple spaces survive every renderer (xml:space is not universally honoured)
-            spans = "".join(f'<tspan class="{cls}">{esc(text).replace(" ", "&#160;")}</tspan>' for text, cls in ln if text)
-            out.append(f'<text x="{PAD}" y="{y}">{spans}</text>')
+            out.append(text(ln, y))
         y += LINE_H
     out.append("</svg>\n")
     return "\n".join(out)
@@ -404,16 +459,7 @@ def build_svg(logo: list[Line], info: list[Line], theme: dict) -> str:
 
 def main() -> None:
     today = date.today()
-    logo_cells = render_logo(ROOT / "assets" / "logo.png")
-    logo: list[Line] = []
-    for cells in logo_cells:            # merge runs of the same class into one tspan
-        ln: Line = []
-        for ch, cls in cells:
-            if ln and ln[-1][1] == cls:
-                ln[-1] = (ln[-1][0] + ch, cls)
-            else:
-                ln.append((ch, cls))
-        logo.append(ln)
+    logo = render_logo(ROOT / "assets" / "logo.png")
 
     stats = collect_stats()
     info = info_lines(stats, today)
